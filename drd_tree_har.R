@@ -257,7 +257,7 @@ build_random_forest <- function(data, formula, split_variables, id, time,
   # number of parameters in the leaf model
   n_param <- length(vars) - 1
   # create random samples of dates  
-  samples <- boot::tsboot(1:n_obs, function(x) x, R = n_obs, sim = "fixed", l = block_length, n.sim = mtree)$t
+  samples <- boot::tsboot(1:n_obs, function(x) x, R = mtree, sim = "fixed", l = block_length, n.sim = n_obs)$t
   
   # use blocked cross-validation to determine the optimal complexity 
   doParallel::registerDoParallel(cluster)
@@ -266,7 +266,7 @@ build_random_forest <- function(data, formula, split_variables, id, time,
                     .export = c(".grow_tree", "prune_tree", "predict_tree", ".lambda_cost_tree", 
                                 ".model_loss_drd_har", ".fit_model_drd_har", ".predict_model_drd_har", 
                                 ".get_split", ".fit_tree")) %dopar% {
-                                  index_i <- table(samples[,tree_i])
+                                  index_i <- table(samples[tree_i,])
                                   
                                   data_i <- NULL
                                   data_x_i <- NULL
@@ -276,7 +276,6 @@ build_random_forest <- function(data, formula, split_variables, id, time,
                                       data_i <- rbind(data_i, data[idx___ %in% idx_m, ])
                                       data_x_i <- rbind(data_x_i, data_x[idx___ %in% idx_m, ])
                                     }
-                                    
                                   }
                                   
                                   # grow a tree on the bootstrapped data
@@ -289,8 +288,13 @@ build_random_forest <- function(data, formula, split_variables, id, time,
                                   # only keep most complex tree
                                   tree_i <- tree_i[[length(tree_i)]]
                                   
+                                  # temporary safty net in case of an error in the code
+                                  if (!is.list(tree_i)) {
+                                    saveRDS(index_i, file = "index_problem.RDS")
+                                  }
+                                  
                                   # fit the final tree
-                                  tree_i$tree_fits <- .fit_tree(tree_i$tree_splits, data = data_i, data_x = data_x_i)
+                                  tree_i[['tree_fits']] <- .fit_tree(tree_i$tree_splits, data = data_i, data_x = data_x_i)
                                   
                                   
                                   return(list("active_tree" = tree_i))
@@ -474,7 +478,11 @@ variable_importance_forest <- function(forest) {
 # Function that grows the tree and returns the final tree and the history of trees for each growing-step
 .grow_tree <- function(data, data_x, data_split, n_ids, min_obs, min_ids, fit, miter, mtry) {
   if (is.null(data_split)) {
-    if (fit) tree_fits <- list(.fit_tree(tree_splits = "", data = data, data_x = NULL))
+    if (fit) {
+      tree_fits <- list(.fit_tree(tree_splits = "", data = data, data_x = NULL))
+    } else {
+      tree_fits <- ""
+    }
     history_tree <- list(list("tree_splits" = "", "tree_losses" = .model_loss_drd_har(data), 
                               "tree_fits" = tree_fits))
     return(history_tree)
