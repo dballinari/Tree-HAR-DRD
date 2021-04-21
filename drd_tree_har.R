@@ -158,8 +158,14 @@ cv_build_tree <- function(data, formula, split_variables, id, time, cv=5, h=1, m
                   "vars"=vars, 
                   "id"=id)
   
+  if (!is.null(cluster)) {
+    doParallel::registerDoParallel(cluster)
+  } else {
+    # run dopar sequentially
+    registerDoSEQ()
+  }
+  
   # use blocked cross-validation to determine the optimal complexity 
-  doParallel::registerDoParallel(cluster)
   mse <- foreach(cv_i = seq(1, cv), .combine = "cbind", 
                  .packages = c("data.table"), 
                  .export = c(".grow_tree", "prune_tree", "predict_tree", ".lambda_cost_tree", 
@@ -259,8 +265,15 @@ build_random_forest <- function(data, formula, split_variables, id, time,
   # create random samples of dates  
   samples <- boot::tsboot(1:n_obs, function(x) x, R = mtree, sim = "fixed", l = block_length, n.sim = n_obs)$t
   
-  # use blocked cross-validation to determine the optimal complexity 
-  doParallel::registerDoParallel(cluster)
+  
+  if (!is.null(cluster)) {
+    doParallel::registerDoParallel(cluster)
+  } else {
+    # run dopar sequentially
+    registerDoSEQ()
+  }
+  
+  # compute trees of the forest using bootstrapped samples 
   forest <- foreach(tree_i = seq(1, mtree),
                     .packages = c("data.table"), 
                     .export = c(".grow_tree", "prune_tree", "predict_tree", ".lambda_cost_tree", 
