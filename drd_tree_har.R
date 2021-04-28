@@ -158,14 +158,8 @@ cv_build_tree <- function(data, formula, split_variables, id, time, cv=5, h=1, m
                   "vars"=vars, 
                   "id"=id)
   
-  if (!is.null(cluster)) {
-    doParallel::registerDoParallel(cluster)
-  } else {
-    # run dopar sequentially
-    registerDoSEQ()
-  }
-  
   # use blocked cross-validation to determine the optimal complexity 
+  doParallel::registerDoParallel(cluster)
   mse <- foreach(cv_i = seq(1, cv), .combine = "cbind", 
                  .packages = c("data.table"), 
                  .export = c(".grow_tree", "prune_tree", "predict_tree", ".lambda_cost_tree", 
@@ -231,6 +225,7 @@ cv_build_tree <- function(data, formula, split_variables, id, time, cv=5, h=1, m
 build_random_forest <- function(data, formula, split_variables, id, time, 
                                 miter=7, mtree=10, min_obs=10, min_ids=10, mtry=NULL, mesh=8, block_length=22, cluster = NULL) {
   require(foreach)
+  require(doRNG)
   # ensure that the data is in a data.table object
   data <- data.table::as.data.table(data)
   # define grid of split variables
@@ -264,23 +259,17 @@ build_random_forest <- function(data, formula, split_variables, id, time,
   n_param <- length(vars) - 1
   # create random samples of dates  
   samples <- boot::tsboot(1:n_obs, function(x) x, R = mtree, sim = "fixed", l = block_length, n.sim = n_obs)$t
-  
-  
-  if (!is.null(cluster)) {
-    doParallel::registerDoParallel(cluster)
-  } else {
-    # run dopar sequentially
-    registerDoSEQ()
-  }
-  
-  # compute trees of the forest using bootstrapped samples 
-  forest <- foreach(tree_i = seq(1, mtree),
+  # create random samples and grow on each a tree, note that we use 'dorng' instead of 'dopar': this ensures the 
+  # reproducibility of the results (ensure that even in parallel computations the random split variables are 
+  # sampled in the same way)
+  doParallel::registerDoParallel(cluster)
+  forest <- foreach(i = 1:mtree,
                     .packages = c("data.table"), 
-                    .export = c(".grow_tree", "prune_tree", "predict_tree", ".lambda_cost_tree", 
-                                ".model_loss_drd_har", ".fit_model_drd_har", ".predict_model_drd_har", 
-                                ".get_split", ".fit_tree")) %dopar% {
-                                  index_i <- table(samples[tree_i,])
-                                  
+                    .export = c(".grow_tree", 
+                                ".model_loss_drd_har", ".fit_model_drd_har", 
+                                ".get_split", ".fit_tree")) %dorng% {
+                                  index_i <- table(samples[i,])
+                                
                                   data_i <- NULL
                                   data_x_i <- NULL
                                   for (m in unique(index_i)) {
@@ -298,20 +287,21 @@ build_random_forest <- function(data, formula, split_variables, id, time,
                                                        n_ids = n_ids, min_obs = min_obs, min_ids = min_ids, 
                                                        fit = FALSE, mtry = mtry)
                                   
+                                  # if no valid tree (that grantees positive definiteness and is stationary) could be found,
+                                  # we return NULL and this tree will be removed from the forest
+                                  if (is.null(tree_i)) return(NULL)
+                                  
                                   # only keep most complex tree
                                   tree_i <- tree_i[[length(tree_i)]]
                                   
-                                  # temporary safty net in case of an error in the code
-                                  if (!is.list(tree_i)) {
-                                    saveRDS(index_i, file = "index_problem.RDS")
-                                  }
                                   
                                   # fit the final tree
-                                  tree_i[['tree_fits']] <- .fit_tree(tree_i$tree_splits, data = data_i, data_x = data_x_i)
-                                  
+                                  tree_i[['tree_fits']] <- .fit_tree(tree_i$tree_splits, data = data_i, data_x = data_x_i, as_list=TRUE)
                                   
                                   return(list("active_tree" = tree_i))
                                 }
+  # remove invalid trees from the forest
+  forest[sapply(forest, is.null)] <- NULL
   
   forest <- list("forest"=forest, 
                  "n_obs"=n_obs, 
@@ -365,6 +355,7 @@ predict_tree <- function(tree, newdata, .data_ready = FALSE) {
       param <- tree$tree_fits[[i]]
       # Filter out all observations that are in the current leaf
       newdata_i <- newdata[eval(parse(text=node)), ]
+      if (nrow(newdata_i)==0) next
       # Make the predictions
       predictions[newdata_i[["__identifier__"]]] <- .predict_model_drd_har(newdata = newdata_i, param = param)
     }
@@ -394,6 +385,7 @@ predict_forest <- function(forest, newdata, cluster = NULL) {
     data.table::setnames(newdata, forest$vars[i], var_i)
     vars_select <- append(vars_select, var_i)
   }
+  
   forest <- forest$forest
   
   doParallel::registerDoParallel(cluster)
@@ -490,25 +482,37 @@ variable_importance_forest <- function(forest) {
 
 # Function that grows the tree and returns the final tree and the history of trees for each growing-step
 .grow_tree <- function(data, data_x, data_split, n_ids, min_obs, min_ids, fit, miter, mtry) {
+  # start by computing the loss when the model is fit over the entire sample
+  tree_losses <- .model_loss_drd_har(data)
+  # if the loss is equal to infinity, which means that there is no stationary HAR-DRD model that guarantees positive definiteness, 
+  # we return NULL
+  if (is.infinite(tree_losses)) return(NULL)
+  
+  # when no data for the splits is provided, we simply return the model for the entire sample
   if (is.null(data_split)) {
     if (fit) {
-      tree_fits <- list(.fit_tree(tree_splits = "", data = data, data_x = NULL))
+      tree_fits <- .fit_tree(tree_splits = "", data = data, data_x = NULL, as_list = TRUE)
     } else {
       tree_fits <- ""
     }
-    history_tree <- list(list("tree_splits" = "", "tree_losses" = .model_loss_drd_har(data), 
+    
+    history_tree <- list(list("tree_splits" = "", "tree_losses" = tree_losses, 
                               "tree_fits" = tree_fits))
     return(history_tree)
   }
+  
+  # start by defining the root model
   variable_importance <- rep(0, ncol(data_split))
   names(variable_importance) <- colnames(data_split)
   tree_losses <- .model_loss_drd_har(data)
   tree_splits <- ""
   candidate_splits <- history_tree <- tree_fits <- vector(mode = "list", length = 1)
-  if (fit) tree_fits[[1]] <- .fit_tree(tree_splits = tree_splits, data = data, data_x = NULL)
+  if (fit) tree_fits[[1]] <- .fit_tree(tree_splits = tree_splits, data = data, data_x = NULL, as_list = FALSE)
   history_tree[[1]] <- list("tree_splits" = tree_splits, "tree_losses" = tree_losses, 
                             "tree_fits" = tree_fits, "variable_importance" = variable_importance)
   
+  # next iterate over all leafs and determine which is the best leaf to split; in the first iteration
+  # we can only split the root
   for (i in 1:miter) {
     best_node_to_split <- NULL
     best_loss_reduction <- 0
@@ -527,6 +531,8 @@ variable_importance_forest <- function(forest) {
       } else {
         split_j <- candidate_splits[[j]]
       }
+      # if the current node cannot be split, skip to the next node:
+      if (is.null(split_j$variable)) next
       
       loss_reduction_j <- tree_losses[j] - split_j$loss_left - split_j$loss_right
       
@@ -627,10 +633,11 @@ variable_importance_forest <- function(forest) {
 }
 
 # Fit the model to a leaf
-.fit_tree <- function(tree_splits, data, data_x) {
+.fit_tree <- function(tree_splits, data, data_x, as_list=TRUE) {
   
   if (length(tree_splits) == 1) {
     fitted_tree <-  .fit_model_drd_har(data = data)
+    if (as_list) fitted_tree <- list(fitted_tree)
     return(fitted_tree)
   }
   
