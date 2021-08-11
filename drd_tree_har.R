@@ -180,6 +180,9 @@ cv_build_tree <- function(data, formula, split_variables, id, time, cv=5, h=1, m
                                                                        data_split = data_split, miter = miter,
                                                                        n_ids = n_ids, min_obs = min_obs, min_ids = min_ids, 
                                                                        fit = TRUE, mtry = mtry)
+                               # if no valid tree (that grantees positive definiteness and is stationary) could be found,
+                               # we return NULL and this validation data is not used
+                               if (is.null(tree_cv[["history_tree"]])) return(NULL)
                                tree_cv[["n_obs"]] <- length(time_index_train)
                                # define the validation dataset
                                data_valid <- cbind(data[idx___ %in% index_data_valid,-"idx___"], data_x[idx___ %in% index_data_valid,-"idx___"])
